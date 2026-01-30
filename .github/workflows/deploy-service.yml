@@ -161,18 +161,26 @@ jobs:
         run: |
           echo "🧪 Running smoke tests..."
           
-          # Check that all pods are in Running state
-          NOT_RUNNING=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}')
+          # Check that all non-terminating pods are in Running state
+          NOT_RUNNING=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} \
+            -o jsonpath='{.items[?(@.status.phase!="Running" && @.status.phase!="Succeeded")].metadata.name}' | \
+            grep -v Terminating || true)
           
-          if [ -n "$NOT_RUNNING" ]; then
-            echo "⚠️ Some pods are not running: $NOT_RUNNING"
+          # Filter out Terminating pods (normal during rolling update)
+          ACTIVE_NOT_RUNNING=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} \
+            --field-selector=status.phase!=Succeeded \
+            -o json | jq -r '.items[] | select(.status.phase != "Running" and (.metadata.deletionTimestamp == null)) | .metadata.name' || true)
+          
+          if [ -n "$ACTIVE_NOT_RUNNING" ]; then
+            echo "⚠️ Some active pods are not running: $ACTIVE_NOT_RUNNING"
             echo "tests_passed=0" >> $GITHUB_OUTPUT
             echo "tests_total=1" >> $GITHUB_OUTPUT
             exit 1
           fi
           
-          # Check that all containers are ready
-          NOT_READY=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==false)].metadata.name}')
+          # Check that all running containers are ready (exclude terminating)
+          NOT_READY=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} \
+            -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running" and (.status.containerStatuses[0].ready == false)) | .metadata.name' || true)
           
           if [ -n "$NOT_READY" ]; then
             echo "⚠️ Some pods are not ready: $NOT_READY"
@@ -182,8 +190,9 @@ jobs:
           fi
           
           echo "✅ All smoke tests passed"
-          echo "  - All pods are Running ✅"
+          echo "  - All active pods are Running ✅"
           echo "  - All containers are Ready ✅"
+          echo "  - (Ignoring terminating pods from previous deployment)"
           echo "tests_passed=2" >> $GITHUB_OUTPUT
           echo "tests_total=2" >> $GITHUB_OUTPUT
 
