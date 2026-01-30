@@ -98,6 +98,19 @@ jobs:
           echo "✅ Connected to Kubernetes cluster"
           echo "✅ Target namespace: ${{ steps.namespace.outputs.namespace }}"
 
+      - name: Log - Kubernetes connected
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ✅ Connected to Kubernetes cluster
+            📍 Target namespace: ${{ steps.namespace.outputs.namespace }}
+            🔗 Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Deploy to Kubernetes
         id: deploy
         run: |
@@ -121,6 +134,19 @@ jobs:
           echo "✅ Deployment updated successfully"
           echo "deploy_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
+      - name: Log - Deployment started
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            🚀 Deployment command executed
+            📦 Image: ${{ steps.build.outputs.image_url }}
+            ⏳ Waiting for rollout to complete...
+
       - name: Wait for rollout
         id: rollout
         run: |
@@ -133,6 +159,19 @@ jobs:
           echo "✅ Rollout completed successfully"
           echo "status=success" >> $GITHUB_OUTPUT
           echo "completion_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Log - Rollout completed
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ✅ Rollout completed successfully
+            ⏱️ Completion time: ${{ steps.rollout.outputs.completion_time }}
+            🔍 Verifying pod health...
 
       - name: Verify deployment
         id: verify
@@ -245,17 +284,22 @@ jobs:
           clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
           operation: PATCH_RUN
           runId: ${{ inputs.port_run_id }}
+          status: "SUCCESS"
+          link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           logMessage: |
             ✅ Deployment completed successfully!
             
-            Service: ${{ inputs.service_name }}
-            Version: ${{ inputs.version }}
-            Environment: ${{ inputs.environment }}
-            Namespace: ${{ steps.namespace.outputs.namespace }}
-            Image: ${{ steps.build.outputs.image_url }}
-            Deploy Time: ${{ steps.deploy.outputs.deploy_time }}
-            Healthy Pods: ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.desired_pods }}
-            Smoke Tests: ${{ steps.smoke_tests.outputs.tests_passed }}/${{ steps.smoke_tests.outputs.tests_total }} passed
+            📊 Deployment Summary:
+            • Service: ${{ inputs.service_name }}
+            • Version: ${{ inputs.version }}
+            • Environment: ${{ inputs.environment }}
+            • Namespace: ${{ steps.namespace.outputs.namespace }}
+            • Image: ${{ steps.build.outputs.image_url }}
+            • Deploy Time: ${{ steps.deploy.outputs.deploy_time }}
+            • Healthy Pods: ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.desired_pods }}
+            • Smoke Tests: ${{ steps.smoke_tests.outputs.tests_passed }}/${{ steps.smoke_tests.outputs.tests_total }} passed
+            
+            🔗 View workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Create deployment summary
         run: |
@@ -289,12 +333,20 @@ jobs:
           clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
           operation: PATCH_RUN
           runId: ${{ inputs.port_run_id }}
+          status: "FAILURE"
+          link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           logMessage: |
             ❌ Deployment failed!
             
-            Service: ${{ inputs.service_name }}
-            Version: ${{ inputs.version }}
-            Environment: ${{ inputs.environment }}
+            📊 Failed Deployment Details:
+            • Service: ${{ inputs.service_name }}
+            • Version: ${{ inputs.version }}
+            • Environment: ${{ inputs.environment }}
+            • Namespace: ${{ steps.namespace.outputs.namespace }}
             
-            Please check the workflow logs for details.
-            Consider rolling back to the previous version if necessary.
+            🔗 Check workflow logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            💡 Next steps:
+            • Review the workflow logs for error details
+            • Consider rolling back to the previous version
+            • Check cluster health: kubectl get pods -n ${{ steps.namespace.outputs.namespace }}

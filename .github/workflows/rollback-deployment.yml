@@ -78,6 +78,22 @@ jobs:
           
           echo "✅ Current deployment: $CURRENT_IMAGE with $READY_REPLICAS/$CURRENT_REPLICAS replicas ready"
 
+      - name: Log - Current status
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            📊 Current Deployment Status:
+            • Image: ${{ steps.current_status.outputs.current_image }}
+            • Ready Pods: ${{ steps.current_status.outputs.ready_replicas }}/${{ steps.current_status.outputs.current_replicas }}
+            • Target Version: ${{ inputs.target_version }}
+            
+            🔄 Initiating rollback...
+
       - name: Execute rollback
         id: rollback
         run: |
@@ -102,6 +118,18 @@ jobs:
           echo "✅ Rollback command executed successfully"
           echo "rollback_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
+      - name: Log - Rollback executed
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ✅ Rollback command executed
+            ⏳ Monitoring rollout progress...
+
       - name: Wait for rollout completion
         id: rollout_status
         run: |
@@ -114,6 +142,18 @@ jobs:
           echo "✅ Rollout completed successfully"
           echo "status=success" >> $GITHUB_OUTPUT
           echo "completion_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Log - Rollout completed
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ✅ Rollout completed successfully
+            🏥 Verifying deployment health...
 
       - name: Verify deployment health
         id: verify
@@ -160,16 +200,23 @@ jobs:
           clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
           operation: PATCH_RUN
           runId: ${{ inputs.port_run_id }}
+          status: "SUCCESS"
+          link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           logMessage: |
             ✅ Rollback completed successfully!
             
-            Service: ${{ inputs.service_name }}
-            Target Version: ${{ inputs.target_version }}
-            Namespace: ${{ inputs.namespace }}
-            Rollback Time: ${{ steps.rollback.outputs.rollback_time }}
-            Healthy Pods: ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.total_pods }}
+            📊 Rollback Summary:
+            • Service: ${{ inputs.service_name }}
+            • Previous Image: ${{ steps.current_status.outputs.current_image }}
+            • Target Version: ${{ inputs.target_version }}
+            • Namespace: ${{ inputs.namespace }}
+            • Rollback Time: ${{ steps.rollback.outputs.rollback_time }}
+            • Healthy Pods: ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.total_pods }}
+            ${{ inputs.incident_id != '' && format('• Associated Incident: {0}', inputs.incident_id) || '' }}
             
-            ${{ inputs.incident_id != '' && format('Associated Incident: {0}', inputs.incident_id) || '' }}
+            🔗 View workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            ✅ Service is now running the previous version and all pods are healthy.
 
       - name: Create rollback summary
         run: |
@@ -200,10 +247,20 @@ jobs:
           clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
           operation: PATCH_RUN
           runId: ${{ inputs.port_run_id }}
+          status: "FAILURE"
+          link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           logMessage: |
             ❌ Rollback failed!
             
-            Service: ${{ inputs.service_name }}
-            Target Version: ${{ inputs.target_version }}
+            📊 Failed Rollback Details:
+            • Service: ${{ inputs.service_name }}
+            • Target Version: ${{ inputs.target_version }}
+            • Namespace: ${{ inputs.namespace }}
             
-            Please check the workflow logs for details.
+            🔗 Check workflow logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            💡 Next steps:
+            • Review the workflow logs for error details
+            • Verify the target version exists
+            • Check cluster health: kubectl get pods -n ${{ inputs.namespace }}
+            • Contact DevOps team if issue persists
