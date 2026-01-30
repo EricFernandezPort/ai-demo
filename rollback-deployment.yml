@@ -1,0 +1,209 @@
+name: Rollback Service Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: 'Service name to rollback'
+        required: true
+        type: string
+      target_version:
+        description: 'Target version to rollback to (e.g., v3.1.9)'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        type: string
+        default: 'production'
+      incident_id:
+        description: 'Associated incident ID (optional)'
+        required: false
+        type: string
+      port_run_id:
+        description: 'Port action run ID'
+        required: false
+        type: string
+
+env:
+  PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+  PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Report rollback started to Port
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            Starting rollback of ${{ inputs.service_name }} to ${{ inputs.target_version }} in ${{ inputs.namespace }} namespace 🔄
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure Kubernetes context
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          
+          # Verify connection
+          kubectl cluster-info
+          echo "✅ Connected to Kubernetes cluster"
+
+      - name: Get current deployment status
+        id: current_status
+        run: |
+          echo "🔍 Checking current deployment status..."
+          
+          # Get current deployment info
+          CURRENT_IMAGE=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.template.spec.containers[0].image}')
+          CURRENT_REPLICAS=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.replicas}')
+          READY_REPLICAS=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.status.readyReplicas}')
+          
+          echo "current_image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+          echo "current_replicas=$CURRENT_REPLICAS" >> $GITHUB_OUTPUT
+          echo "ready_replicas=$READY_REPLICAS" >> $GITHUB_OUTPUT
+          
+          echo "✅ Current deployment: $CURRENT_IMAGE with $READY_REPLICAS/$CURRENT_REPLICAS replicas ready"
+
+      - name: Execute rollback
+        id: rollback
+        run: |
+          echo "🔄 Executing rollback of ${{ inputs.service_name }} to ${{ inputs.target_version }}..."
+          
+          # Get container name (first container)
+          CONTAINER_NAME=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.template.spec.containers[0].name}')
+          echo "Container name: $CONTAINER_NAME"
+          
+          # If specific version provided, set the image
+          if [ -n "${{ inputs.target_version }}" ] && [ "${{ inputs.target_version }}" != "previous" ]; then
+            echo "Rolling back to specific version: ${{ inputs.target_version }}"
+            kubectl set image deployment/${{ inputs.service_name }} \
+              $CONTAINER_NAME=nginx:${{ inputs.target_version }} \
+              -n ${{ inputs.namespace }}
+          else
+            # Otherwise, rollback to previous revision
+            echo "Rolling back to previous revision..."
+            kubectl rollout undo deployment/${{ inputs.service_name }} -n ${{ inputs.namespace }}
+          fi
+          
+          echo "✅ Rollback command executed successfully"
+          echo "rollback_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Wait for rollout completion
+        id: rollout_status
+        run: |
+          echo "⏳ Waiting for rollout to complete..."
+          
+          kubectl rollout status deployment/${{ inputs.service_name }} \
+            -n ${{ inputs.namespace }} \
+            --timeout=5m
+          
+          echo "✅ Rollout completed successfully"
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "completion_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Verify deployment health
+        id: verify
+        run: |
+          echo "🏥 Verifying deployment health..."
+          
+          # Get deployment status
+          kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }}
+          
+          echo ""
+          echo "Pods Status:"
+          kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.service_name }}
+          
+          # Get pod counts
+          READY_PODS=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.status.readyReplicas}')
+          TOTAL_PODS=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.replicas}')
+          
+          echo ""
+          echo "✅ Deployment health verified: $READY_PODS/$TOTAL_PODS pods ready"
+          echo "healthy_pods=$READY_PODS" >> $GITHUB_OUTPUT
+          echo "total_pods=$TOTAL_PODS" >> $GITHUB_OUTPUT
+
+      - name: Update Port entity with rollback status
+        if: env.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ inputs.service_name }}
+          blueprint: application
+          properties: |
+            {
+              "current_version": "${{ inputs.target_version }}",
+              "last_deployment_date": "${{ steps.rollback.outputs.rollback_time }}",
+              "deployment_status": "rolled_back"
+            }
+
+      - name: Report rollback success to Port
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ✅ Rollback completed successfully!
+            
+            Service: ${{ inputs.service_name }}
+            Target Version: ${{ inputs.target_version }}
+            Namespace: ${{ inputs.namespace }}
+            Rollback Time: ${{ steps.rollback.outputs.rollback_time }}
+            Healthy Pods: ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.total_pods }}
+            
+            ${{ inputs.incident_id != '' && format('Associated Incident: {0}', inputs.incident_id) || '' }}
+
+      - name: Create rollback summary
+        run: |
+          echo "# Rollback Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Rollback Completed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ inputs.service_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Previous Image | ${{ steps.current_status.outputs.current_image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Version | ${{ inputs.target_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ inputs.namespace }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rollback Time | ${{ steps.rollback.outputs.rollback_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Completion Time | ${{ steps.rollout_status.outputs.completion_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Healthy Pods | ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.total_pods }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "- Monitor service metrics for stability" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify SLO compliance" >> $GITHUB_STEP_SUMMARY
+          echo "- Update incident status if applicable" >> $GITHUB_STEP_SUMMARY
+
+      - name: Handle rollback failure
+        if: failure() && env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ❌ Rollback failed!
+            
+            Service: ${{ inputs.service_name }}
+            Target Version: ${{ inputs.target_version }}
+            
+            Please check the workflow logs for details.

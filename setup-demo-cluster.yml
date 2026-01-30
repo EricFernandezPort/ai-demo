@@ -1,0 +1,84 @@
+name: Setup Demo Kubernetes Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - create
+          - delete
+        default: 'create'
+
+jobs:
+  manage-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        if: inputs.action == 'create'
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: port-demo
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+
+      - name: Deploy sample services
+        if: inputs.action == 'create'
+        run: |
+          # Create namespace
+          kubectl create namespace production
+          kubectl create namespace staging
+          
+          # Deploy payment-service
+          kubectl create deployment payment-service \
+            --image=nginx:latest \
+            --replicas=3 \
+            -n production
+          
+          kubectl label deployment payment-service \
+            app=payment-service version=v3.2.0 \
+            -n production
+          
+          # Deploy search-service
+          kubectl create deployment search-service \
+            --image=nginx:latest \
+            --replicas=4 \
+            -n production
+          
+          kubectl label deployment search-service \
+            app=search-service version=v1.5.0 \
+            -n production
+          
+          # Wait for deployments
+          kubectl rollout status deployment/payment-service -n production
+          kubectl rollout status deployment/search-service -n production
+          
+          echo "✅ Demo cluster created with sample services"
+
+      - name: Show cluster info
+        if: inputs.action == 'create'
+        run: |
+          echo "Cluster Status:"
+          kubectl cluster-info
+          echo ""
+          echo "Deployments:"
+          kubectl get deployments -n production
+          echo ""
+          echo "Pods:"
+          kubectl get pods -n production
+
+      - name: Delete cluster
+        if: inputs.action == 'delete'
+        run: |
+          kind delete cluster --name port-demo
+          echo "✅ Cluster deleted"

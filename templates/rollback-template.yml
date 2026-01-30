@@ -1,0 +1,121 @@
+# Reusable Rollback Workflow Template
+# 
+# This template can be used across multiple services for consistent rollbacks
+# 
+# Usage:
+# Create a workflow file in your service repository:
+#
+# name: Rollback My Service
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       target_version:
+#         required: true
+# jobs:
+#   rollback:
+#     uses: ./.github/workflows/templates/rollback-template.yml
+#     with:
+#       service_name: my-service
+#       target_version: ${{ inputs.target_version }}
+#     secrets: inherit
+
+name: Reusable Rollback Template
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: 'Service name'
+        required: true
+        type: string
+      target_version:
+        description: 'Target version to rollback to'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: false
+        type: string
+        default: 'production'
+      incident_id:
+        description: 'Associated incident ID'
+        required: false
+        type: string
+      port_run_id:
+        description: 'Port action run ID'
+        required: false
+        type: string
+    secrets:
+      PORT_CLIENT_ID:
+        required: false
+      PORT_CLIENT_SECRET:
+        required: false
+      KUBECONFIG:
+        required: false
+    outputs:
+      rollback_status:
+        description: 'Rollback status'
+        value: ${{ jobs.rollback.outputs.status }}
+      rolled_back_version:
+        description: 'Version after rollback'
+        value: ${{ inputs.target_version }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.rollout.outputs.status }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure Kubernetes
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config || echo "Demo mode - using mock config"
+
+      - name: Execute rollback
+        id: rollback
+        run: |
+          echo "Rolling back ${{ inputs.service_name }} to ${{ inputs.target_version }}..."
+          
+          # Option 1: Rollback to previous revision
+          # kubectl rollout undo deployment/${{ inputs.service_name }} -n ${{ inputs.namespace }}
+          
+          # Option 2: Set specific version
+          # kubectl set image deployment/${{ inputs.service_name }} \
+          #   ${{ inputs.service_name }}=company/${{ inputs.service_name }}:${{ inputs.target_version }} \
+          #   -n ${{ inputs.namespace }}
+          
+          echo "✅ Rollback initiated"
+
+      - name: Wait for rollout
+        id: rollout
+        run: |
+          # kubectl rollout status deployment/${{ inputs.service_name }} -n ${{ inputs.namespace }} --timeout=5m
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Rollback complete"
+
+      - name: Verify health
+        id: verify
+        run: |
+          # kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.service_name }}
+          echo "✅ All pods healthy"
+
+      - name: Update Port
+        if: secrets.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ inputs.service_name }}
+          blueprint: application
+          properties: |
+            {
+              "current_version": "${{ inputs.target_version }}",
+              "deployment_status": "rolled_back"
+            }

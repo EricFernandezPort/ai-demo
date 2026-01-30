@@ -1,0 +1,291 @@
+name: Deploy Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: 'Service name to deploy'
+        required: true
+        type: string
+      version:
+        description: 'Version to deploy (e.g., v3.2.0)'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: 'staging'
+      namespace:
+        description: 'Kubernetes namespace'
+        required: false
+        type: string
+      port_run_id:
+        description: 'Port action run ID'
+        required: false
+        type: string
+
+env:
+  PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+  PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+  DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY || 'company.azurecr.io' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Report deployment started to Port
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            Starting deployment of ${{ inputs.service_name }}:${{ inputs.version }} to ${{ inputs.environment }} 🚀
+
+      - name: Set namespace
+        id: namespace
+        run: |
+          if [ -z "${{ inputs.namespace }}" ]; then
+            echo "namespace=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "namespace=${{ inputs.namespace }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare deployment image
+        id: build
+        run: |
+          echo "🔨 Preparing image for ${{ inputs.service_name }}:${{ inputs.version }}..."
+          
+          # For demo, we use nginx images with version tags
+          # In production, this would build and push your actual service image:
+          # docker build -t ${{ env.DOCKER_REGISTRY }}/${{ inputs.service_name }}:${{ inputs.version }} .
+          # docker push ${{ env.DOCKER_REGISTRY }}/${{ inputs.service_name }}:${{ inputs.version }}
+          
+          # Extract version number (e.g., "v1.25" -> "1.25")
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"  # Remove 'v' prefix if present
+          
+          # Use nginx with the specified version, fallback to 'latest'
+          IMAGE_URL="nginx:${VERSION:-latest}"
+          
+          echo "✅ Using image: $IMAGE_URL"
+          echo "image_url=$IMAGE_URL" >> $GITHUB_OUTPUT
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure Kubernetes context
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          
+          # Verify connection
+          kubectl cluster-info
+          echo "✅ Connected to Kubernetes cluster"
+          echo "✅ Target namespace: ${{ steps.namespace.outputs.namespace }}"
+
+      - name: Deploy to Kubernetes
+        id: deploy
+        run: |
+          echo "🚀 Deploying ${{ inputs.service_name }}:${{ inputs.version }} to ${{ inputs.environment }}..."
+          
+          # Get container name (first container in the deployment)
+          CONTAINER_NAME=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ steps.namespace.outputs.namespace }} -o jsonpath='{.spec.template.spec.containers[0].name}')
+          echo "Container name: $CONTAINER_NAME"
+          
+          # Update deployment with new image
+          kubectl set image deployment/${{ inputs.service_name }} \
+            $CONTAINER_NAME=${{ steps.build.outputs.image_url }} \
+            -n ${{ steps.namespace.outputs.namespace }}
+          
+          # Record the deployment in history
+          kubectl annotate deployment/${{ inputs.service_name }} \
+            kubernetes.io/change-cause="Deploy version ${{ inputs.version }} via Port/GitHub Actions" \
+            -n ${{ steps.namespace.outputs.namespace }} \
+            --overwrite
+          
+          echo "✅ Deployment updated successfully"
+          echo "deploy_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Wait for rollout
+        id: rollout
+        run: |
+          echo "⏳ Waiting for rollout to complete..."
+          
+          kubectl rollout status deployment/${{ inputs.service_name }} \
+            -n ${{ steps.namespace.outputs.namespace }} \
+            --timeout=5m
+          
+          echo "✅ Rollout completed successfully"
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "completion_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Verify deployment
+        id: verify
+        run: |
+          echo "🏥 Verifying deployment health..."
+          
+          # Get deployment status
+          echo "Deployment Status:"
+          kubectl get deployment ${{ inputs.service_name }} -n ${{ steps.namespace.outputs.namespace }}
+          
+          echo ""
+          echo "Pod Status:"
+          kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }}
+          
+          # Get pod counts
+          READY_PODS=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ steps.namespace.outputs.namespace }} -o jsonpath='{.status.readyReplicas}')
+          DESIRED_PODS=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ steps.namespace.outputs.namespace }} -o jsonpath='{.spec.replicas}')
+          
+          echo ""
+          echo "✅ Deployment verified: $READY_PODS/$DESIRED_PODS pods ready"
+          echo "healthy_pods=$READY_PODS" >> $GITHUB_OUTPUT
+          echo "desired_pods=$DESIRED_PODS" >> $GITHUB_OUTPUT
+
+      - name: Run smoke tests
+        id: smoke_tests
+        run: |
+          echo "🧪 Running smoke tests..."
+          
+          # Check that all pods are in Running state
+          NOT_RUNNING=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}')
+          
+          if [ -n "$NOT_RUNNING" ]; then
+            echo "⚠️ Some pods are not running: $NOT_RUNNING"
+            echo "tests_passed=0" >> $GITHUB_OUTPUT
+            echo "tests_total=1" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Check that all containers are ready
+          NOT_READY=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==false)].metadata.name}')
+          
+          if [ -n "$NOT_READY" ]; then
+            echo "⚠️ Some pods are not ready: $NOT_READY"
+            echo "tests_passed=0" >> $GITHUB_OUTPUT
+            echo "tests_total=1" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "✅ All smoke tests passed"
+          echo "  - All pods are Running ✅"
+          echo "  - All containers are Ready ✅"
+          echo "tests_passed=2" >> $GITHUB_OUTPUT
+          echo "tests_total=2" >> $GITHUB_OUTPUT
+
+      - name: Update Port entity with deployment
+        if: env.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ inputs.service_name }}
+          blueprint: application
+          properties: |
+            {
+              "current_version": "${{ inputs.version }}",
+              "last_deployment_date": "${{ steps.deploy.outputs.deploy_time }}",
+              "deployment_status": "deployed",
+              "environment": "${{ inputs.environment }}"
+            }
+
+      - name: Create deployment in Port
+        if: env.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ inputs.service_name }}-${{ inputs.version }}-${{ github.run_number }}
+          blueprint: k8sDeployment
+          properties: |
+            {
+              "version": "${{ inputs.version }}",
+              "deploymentTime": "${{ steps.deploy.outputs.deploy_time }}",
+              "environment": "${{ inputs.environment }}",
+              "status": "Healthy",
+              "replicas": ${{ steps.verify.outputs.desired_pods }},
+              "availableReplicas": ${{ steps.verify.outputs.healthy_pods }}
+            }
+          relations: |
+            {
+              "application": "${{ inputs.service_name }}",
+              "namespace": "${{ steps.namespace.outputs.namespace }}"
+            }
+
+      - name: Report deployment success to Port
+        if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ✅ Deployment completed successfully!
+            
+            Service: ${{ inputs.service_name }}
+            Version: ${{ inputs.version }}
+            Environment: ${{ inputs.environment }}
+            Namespace: ${{ steps.namespace.outputs.namespace }}
+            Image: ${{ steps.build.outputs.image_url }}
+            Deploy Time: ${{ steps.deploy.outputs.deploy_time }}
+            Healthy Pods: ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.desired_pods }}
+            Smoke Tests: ${{ steps.smoke_tests.outputs.tests_passed }}/${{ steps.smoke_tests.outputs.tests_total }} passed
+
+      - name: Create deployment summary
+        run: |
+          echo "# Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Deployment Completed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ inputs.service_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ inputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ steps.namespace.outputs.namespace }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | ${{ steps.build.outputs.image_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Time | ${{ steps.build.outputs.build_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy Time | ${{ steps.deploy.outputs.deploy_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Completion Time | ${{ steps.rollout.outputs.completion_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Healthy Pods | ${{ steps.verify.outputs.healthy_pods }}/${{ steps.verify.outputs.desired_pods }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ${{ steps.smoke_tests.outputs.tests_passed }}/${{ steps.smoke_tests.outputs.tests_total }} ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "- Monitor application metrics" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify SLO compliance" >> $GITHUB_STEP_SUMMARY
+          echo "- Check for any alerts or anomalies" >> $GITHUB_STEP_SUMMARY
+
+      - name: Handle deployment failure
+        if: failure() && env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ❌ Deployment failed!
+            
+            Service: ${{ inputs.service_name }}
+            Version: ${{ inputs.version }}
+            Environment: ${{ inputs.environment }}
+            
+            Please check the workflow logs for details.
+            Consider rolling back to the previous version if necessary.
