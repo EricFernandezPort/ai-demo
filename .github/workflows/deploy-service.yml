@@ -259,16 +259,19 @@ jobs:
           clientId: ${{ secrets.PORT_CLIENT_ID }}
           clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
           operation: UPSERT
-          identifier: ${{ inputs.service_name }}-${{ inputs.version }}-${{ github.run_number }}
+          identifier: ${{ inputs.service_name }}-${{ steps.namespace.outputs.namespace }}
           blueprint: k8sDeployment
           properties: |
             {
-              "version": "${{ inputs.version }}",
-              "deploymentTime": "${{ steps.deploy.outputs.deploy_time }}",
-              "environment": "${{ inputs.environment }}",
-              "status": "Healthy",
+              "name": "${{ inputs.service_name }}",
+              "namespaceName": "${{ steps.namespace.outputs.namespace }}",
+              "image": "${{ steps.build.outputs.image_url }}",
               "replicas": ${{ steps.verify.outputs.desired_pods }},
-              "availableReplicas": ${{ steps.verify.outputs.healthy_pods }}
+              "availableReplicas": ${{ steps.verify.outputs.healthy_pods }},
+              "readyReplicas": ${{ steps.verify.outputs.healthy_pods }},
+              "healthStatus": "Healthy",
+              "strategy": "RollingUpdate",
+              "createdAt": "${{ steps.deploy.outputs.deploy_time }}"
             }
           relations: |
             {

@@ -192,6 +192,40 @@ jobs:
               "deployment_status": "rolled_back"
             }
 
+      - name: Get new deployment image
+        id: new_image
+        run: |
+          NEW_IMAGE=$(kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "image=$NEW_IMAGE" >> $GITHUB_OUTPUT
+          echo "New image: $NEW_IMAGE"
+
+      - name: Update deployment entity in Port
+        if: env.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ inputs.service_name }}-${{ inputs.namespace }}
+          blueprint: k8sDeployment
+          properties: |
+            {
+              "name": "${{ inputs.service_name }}",
+              "namespaceName": "${{ inputs.namespace }}",
+              "image": "${{ steps.new_image.outputs.image }}",
+              "replicas": ${{ steps.verify.outputs.total_pods }},
+              "availableReplicas": ${{ steps.verify.outputs.healthy_pods }},
+              "readyReplicas": ${{ steps.verify.outputs.healthy_pods }},
+              "healthStatus": "Healthy",
+              "strategy": "RollingUpdate",
+              "createdAt": "${{ steps.rollback.outputs.rollback_time }}"
+            }
+          relations: |
+            {
+              "application": "${{ inputs.service_name }}",
+              "namespace": "${{ inputs.namespace }}"
+            }
+
       - name: Report rollback success to Port
         if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
         uses: port-labs/port-github-action@v1
