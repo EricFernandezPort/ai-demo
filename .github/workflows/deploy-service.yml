@@ -81,6 +81,53 @@ jobs:
           echo "✅ Using image: $IMAGE_URL"
           echo "image_url=$IMAGE_URL" >> $GITHUB_OUTPUT
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+      
+      - name: Validate image exists
+        id: validate_image
+        run: |
+          echo "🔍 Validating that image ${{ steps.build.outputs.image_url }} exists..."
+          
+          # Try to pull the image manifest to verify it exists
+          if docker manifest inspect ${{ steps.build.outputs.image_url }} > /dev/null 2>&1; then
+            echo "✅ Image exists and is accessible"
+            echo "image_valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Image ${{ steps.build.outputs.image_url }} does not exist or is not accessible"
+            echo ""
+            echo "💡 Common nginx versions that work:"
+            echo "   - 1.25.0, 1.25.1, 1.25.2, 1.25.3, 1.25.4, 1.25.5"
+            echo "   - 1.24.0, 1.23.0, 1.22.0"
+            echo "   - latest, stable, mainline"
+            echo ""
+            echo "🔗 Check available tags: https://hub.docker.com/_/nginx/tags"
+            echo ""
+            echo "image_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: Report image validation failure to Port
+        if: failure() && steps.validate_image.outcome == 'failure' && env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: "FAILURE"
+          link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          logMessage: |
+            ❌ Image validation failed!
+            
+            The image ${{ steps.build.outputs.image_url }} does not exist or is not accessible.
+            
+            💡 For this demo, we use nginx images. Common versions that work:
+            • 1.25.0, 1.25.1, 1.25.2, 1.25.3, 1.25.4, 1.25.5
+            • 1.24.0, 1.23.0, 1.22.0
+            • latest, stable, mainline
+            
+            🔗 Check available nginx tags: https://hub.docker.com/_/nginx/tags
+            
+            📝 Note: Do not use 'v' prefix for nginx versions (use '1.25.0' not 'v1.25.0')
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v3
@@ -152,13 +199,113 @@ jobs:
         run: |
           echo "⏳ Waiting for rollout to complete..."
           
+          # Increase timeout to 10 minutes for slower deployments
           kubectl rollout status deployment/${{ inputs.service_name }} \
             -n ${{ steps.namespace.outputs.namespace }} \
-            --timeout=5m
+            --timeout=10m
           
           echo "✅ Rollout completed successfully"
           echo "status=success" >> $GITHUB_OUTPUT
           echo "completion_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+      
+      - name: Diagnose rollout failure
+        if: failure() && steps.rollout.outcome == 'failure'
+        run: |
+          echo "❌ Rollout failed or timed out. Collecting diagnostic information..."
+          echo ""
+          
+          echo "=== Deployment Status ==="
+          kubectl get deployment ${{ inputs.service_name }} -n ${{ steps.namespace.outputs.namespace }} -o wide || true
+          echo ""
+          
+          echo "=== ReplicaSet Status ==="
+          kubectl get rs -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o wide || true
+          echo ""
+          
+          echo "=== Pod Status ==="
+          kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o wide || true
+          echo ""
+          
+          echo "=== Pod Descriptions (for failed/pending pods) ==="
+          for pod in $(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}'); do
+            echo "--- Pod: $pod ---"
+            kubectl describe pod $pod -n ${{ steps.namespace.outputs.namespace }} || true
+            echo ""
+          done
+          
+          echo "=== Recent Events ==="
+          kubectl get events -n ${{ steps.namespace.outputs.namespace }} \
+            --field-selector involvedObject.name=${{ inputs.service_name }} \
+            --sort-by='.lastTimestamp' \
+            --limit=20 || true
+          echo ""
+          
+          echo "=== Pod Logs (for failed pods) ==="
+          for pod in $(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}'); do
+            echo "--- Logs for pod: $pod ---"
+            kubectl logs $pod -n ${{ steps.namespace.outputs.namespace }} --tail=50 --all-containers=true || true
+            echo ""
+            echo "--- Previous logs (if pod restarted) ---"
+            kubectl logs $pod -n ${{ steps.namespace.outputs.namespace }} --previous --tail=50 --all-containers=true 2>/dev/null || echo "No previous logs available"
+            echo ""
+          done
+          
+          echo "=== Common Issues to Check ==="
+          echo "1. Image pull errors - Check if the image exists and registry credentials are correct"
+          echo "2. Resource constraints - Check if cluster has enough CPU/memory"
+          echo "3. Readiness probes - Check if health check endpoints are working"
+          echo "4. Configuration errors - Check environment variables and config maps"
+          echo "5. Network policies - Check if pods can communicate as needed"
+          
+          exit 1
+
+      - name: Log - Rollout failed
+        if: failure() && steps.rollout.outcome == 'failure' && env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        run: |
+          # Get diagnostic summary
+          POD_STATUS=$(kubectl get pods -n ${{ steps.namespace.outputs.namespace }} -l app=${{ inputs.service_name }} -o wide 2>/dev/null || echo "Unable to get pod status")
+          RECENT_EVENTS=$(kubectl get events -n ${{ steps.namespace.outputs.namespace }} --field-selector involvedObject.name=${{ inputs.service_name }} --sort-by='.lastTimestamp' --limit=5 2>/dev/null || echo "Unable to get events")
+          
+          # Save to file for Port update
+          cat > /tmp/rollout_failure.txt << 'EOFLOG'
+          ❌ Rollout failed or timed out
+          
+          The deployment did not complete within the timeout period. This usually indicates:
+          • Image pull errors (image doesn't exist or registry auth failed)
+          • Insufficient cluster resources (CPU/memory)
+          • Failed readiness/liveness probes
+          • Application startup errors
+          
+          Pod Status:
+          EOFLOG
+          echo "$POD_STATUS" >> /tmp/rollout_failure.txt
+          echo "" >> /tmp/rollout_failure.txt
+          echo "Recent Events:" >> /tmp/rollout_failure.txt
+          echo "$RECENT_EVENTS" >> /tmp/rollout_failure.txt
+          echo "" >> /tmp/rollout_failure.txt
+          echo "🔗 View full diagnostics in workflow logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> /tmp/rollout_failure.txt
+          
+          echo "rollout_failed=true" >> $GITHUB_OUTPUT
+      
+      - name: Report rollout failure to Port
+        if: failure() && steps.rollout.outcome == 'failure' && env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: |
+            ❌ Rollout failed or timed out
+            
+            The deployment did not complete within 10 minutes. Common causes:
+            • Image pull errors (check if image exists: ${{ steps.build.outputs.image_url }})
+            • Insufficient cluster resources
+            • Failed readiness/liveness probes
+            • Application startup errors
+            
+            🔍 Check workflow logs for detailed diagnostics:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Log - Rollout completed
         if: env.PORT_CLIENT_ID != '' && inputs.port_run_id != ''
@@ -250,6 +397,20 @@ jobs:
               "last_deployment_date": "${{ steps.deploy.outputs.deploy_time }}",
               "deployment_status": "deployed",
               "environment": "${{ inputs.environment }}"
+            }
+
+      - name: Create namespace in Port
+        if: env.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ steps.namespace.outputs.namespace }}
+          blueprint: k8sNamespace
+          properties: |
+            {
+              "name": "${{ steps.namespace.outputs.namespace }}"
             }
 
       - name: Create deployment in Port

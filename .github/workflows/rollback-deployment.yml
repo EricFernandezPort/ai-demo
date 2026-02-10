@@ -199,6 +199,20 @@ jobs:
           echo "image=$NEW_IMAGE" >> $GITHUB_OUTPUT
           echo "New image: $NEW_IMAGE"
 
+      - name: Create namespace in Port
+        if: env.PORT_CLIENT_ID != ''
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          operation: UPSERT
+          identifier: ${{ inputs.namespace }}
+          blueprint: k8sNamespace
+          properties: |
+            {
+              "name": "${{ inputs.namespace }}"
+            }
+
       - name: Update deployment entity in Port
         if: env.PORT_CLIENT_ID != ''
         uses: port-labs/port-github-action@v1

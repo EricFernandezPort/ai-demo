@@ -46,7 +46,9 @@ Ensure the following blueprints exist in your Port.io workspace:
 
 - `application` - Represents deployed applications
 - `k8sDeployment` - Represents individual Kubernetes deployments
-- `namespace` - Represents Kubernetes namespaces
+- `k8sNamespace` - Represents Kubernetes namespaces (required for deployment relations)
+
+**Important:** The workflows automatically create namespace entities before creating deployments. This ensures that deployment entities can properly reference their namespaces through relations.
 
 ### 3. Demo Cluster (Optional)
 
@@ -150,6 +152,63 @@ For demonstration purposes, this project uses `nginx` images with version tags. 
 - Add integration tests and monitoring
 
 ## Troubleshooting
+
+For detailed troubleshooting information, see [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
+
+### Quick Reference
+
+#### Rollout Timeout: "error: timed out waiting for the condition"
+
+When a deployment rollout times out, it means the new pods didn't become ready within the timeout period (10 minutes). The workflow now provides detailed diagnostics to help identify the issue.
+
+**Common Causes:**
+
+1. **Image Pull Errors** (Most Common)
+   - The specified image doesn't exist
+   - Image tag is incorrect (e.g., using `v1.25.0` but image is tagged as `1.25.0`)
+   - No registry credentials or wrong credentials
+   - Check: `kubectl describe pod <pod-name> -n <namespace>` and look for `ImagePullBackOff` or `ErrImagePull`
+
+2. **Insufficient Resources**
+   - Cluster doesn't have enough CPU or memory
+   - Check: `kubectl describe nodes` and look for resource pressure
+   - Check: Pod events for `FailedScheduling` messages
+
+3. **Failed Health Checks**
+   - Readiness probes are failing
+   - Application is starting but not responding to health check endpoint
+   - Check: Pod logs for startup errors
+
+4. **Application Crashes**
+   - Application starts but crashes immediately
+   - Configuration errors (wrong env vars, missing config)
+   - Check: Pod logs using `kubectl logs <pod-name> -n <namespace>`
+
+**How to Diagnose:**
+
+The workflow automatically collects diagnostic information when a rollout fails:
+- Pod status and descriptions
+- Recent Kubernetes events
+- Pod logs for failed containers
+- Previous logs if pods restarted
+
+Find this information in the "Diagnose rollout failure" step in the workflow logs.
+
+**Quick Fixes:**
+
+For this demo project specifically, the most common issue is image tag format:
+- ✅ Correct: Use version like `1.25.0` (matches nginx image tags)
+- ❌ Wrong: Using `v1.25.0` (nginx doesn't have images with 'v' prefix)
+
+The workflow strips the 'v' prefix, but ensure you're using a version that actually exists in the nginx registry.
+
+### Error: "Entity with identifier 'X' does not exist in the blueprint 'k8sNamespace'"
+
+This error occurs when a deployment tries to reference a namespace that doesn't exist in Port. The workflows now automatically create namespace entities before creating deployments, so this should not happen. If you still encounter this error:
+
+1. Verify the `k8sNamespace` blueprint exists in your Port workspace
+2. Ensure the "Create namespace in Port" step runs before "Create deployment in Port"
+3. Check that the namespace identifier matches between the two steps
 
 ### Deployment Fails with "deployment not found"
 
