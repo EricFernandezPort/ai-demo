@@ -190,17 +190,11 @@ jobs:
           echo "Device flow started — URI: $VERIFY_URI  Code: $USER_CODE"
 
           # 2. Send auth instructions to Port action logs ───────────────────
+          LOG_MSG="GitHub Authentication Required\n\nPlease open the URL below in your browser and enter the one-time code:\n\n  URL:  ${VERIFY_URI}\n  Code: ${USER_CODE}\n\nWaiting for authentication (timeout: 10 minutes)..."
           LOG_PAYLOAD=$(jq -n \
-            --arg msg "GitHub Authentication Required
-
-Please open the URL below in your browser and enter the one-time code:
-
-  URL:  ${VERIFY_URI}
-  Code: ${USER_CODE}
-
-Waiting for authentication (timeout: 10 minutes)..." \
+            --arg msg "$LOG_MSG" \
             --arg label "Waiting for Auth" \
-            '{message: $msg, statusLabel: $label}')
+            '{"message": $msg, "statusLabel": $label}')
 
           curl -s -X POST "https://api.port.io/v1/actions/runs/${PORT_RUN_ID}/logs" \
             -H "Authorization: Bearer ${PORT_TOKEN}" \
@@ -290,18 +284,13 @@ Waiting for authentication (timeout: 10 minutes)..." \
           git push origin "$BRANCH_NAME"
 
           # Build PR body ────────────────────────────────────────────────────
-          FOOTER="---
-**Requested by:** ${USER_IDENTIFIER}
-**Team:** ${TEAM_NAME}"
+          FOOTER=$(printf -- '---\n**Requested by:** %s\n**Team:** %s' "${USER_IDENTIFIER}" "${TEAM_NAME}")
           if [ -n "$TAGS" ]; then
-            FOOTER="${FOOTER}
-**Tags:** ${TAGS}"
+            FOOTER=$(printf '%s\n**Tags:** %s' "$FOOTER" "${TAGS}")
           fi
 
           if [ -n "$PR_DESCRIPTION" ]; then
-            PR_BODY="${PR_DESCRIPTION}
-
-${FOOTER}"
+            PR_BODY=$(printf '%s\n\n%s' "${PR_DESCRIPTION}" "$FOOTER")
           else
             PR_BODY="$FOOTER"
           fi
