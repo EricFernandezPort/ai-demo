@@ -84,20 +84,15 @@ jobs:
       # STEP 2 — Fetch repository entity from Port
       # Extracts the GitHub URL and parses org, repo name, default branch.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Fetch repository entity from Port
+      - name: Parse repository entity from Port input
         id: repo_data
-        env:
-          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
         run: |
-          ENTITY=$(curl -s \
-            "https://api.port.io/v1/blueprints/githubRepository/entities/${REPOSITORY_ID}" \
-            -H "Authorization: Bearer ${PORT_TOKEN}")
-
-          REPO_URL=$(echo "$ENTITY"       | jq -r '.entity.properties.url          // empty')
-          DEFAULT_BRANCH=$(echo "$ENTITY" | jq -r '.entity.properties.defaultBranch // "main"')
+          # Port passes the full entity object as REPOSITORY_ID — no API call needed.
+          REPO_URL=$(echo "$REPOSITORY_ID"       | jq -r '.properties.url          // empty')
+          DEFAULT_BRANCH=$(echo "$REPOSITORY_ID" | jq -r '.properties.defaultBranch // "main"')
 
           if [ -z "$REPO_URL" ]; then
-            echo "Could not resolve repository URL from Port entity '${REPOSITORY_ID}'."
+            echo "No url property found in the githubRepository entity."
             exit 1
           fi
 
