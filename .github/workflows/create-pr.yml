@@ -1,0 +1,368 @@
+name: Create GitHub Pull Request
+
+# Triggered by Port's self-service action "create_github_pr".
+# Port dispatches this via the GitHub invocation method, sending all form
+# inputs as workflow_dispatch inputs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      port_run_id:
+        description: "Port action run ID (used to post logs and update status)"
+        required: true
+        type: string
+      user_identifier:
+        description: "Port user identifier — email of the person who triggered the action"
+        required: true
+        type: string
+      team_identifier:
+        description: "Port team identifier"
+        required: false
+        type: string
+      repository_id:
+        description: "Port entity identifier for the target githubRepository"
+        required: true
+        type: string
+      pr_title:
+        description: "Pull request title"
+        required: true
+        type: string
+      pr_description:
+        description: "Pull request description (markdown)"
+        required: false
+        type: string
+      branch_name:
+        description: "Feature branch to create (e.g. feat/my-feature)"
+        required: true
+        type: string
+      tags:
+        description: "Comma-separated list of labels to add to the PR"
+        required: false
+        type: string
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+
+    # Expose all workflow_dispatch inputs as job-level env vars so that
+    # no run: step ever interpolates ${{ inputs.* }} directly (injection safety).
+    env:
+      PORT_RUN_ID: ${{ inputs.port_run_id }}
+      USER_IDENTIFIER: ${{ inputs.user_identifier }}
+      TEAM_IDENTIFIER: ${{ inputs.team_identifier }}
+      REPOSITORY_ID: ${{ inputs.repository_id }}
+      PR_TITLE: ${{ inputs.pr_title }}
+      PR_DESCRIPTION: ${{ inputs.pr_description }}
+      BRANCH_NAME: ${{ inputs.branch_name }}
+      TAGS: ${{ inputs.tags }}
+
+    steps:
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 1 — Authenticate with Port API
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Get Port access token
+        id: port_auth
+        env:
+          PORT_CLIENT_ID: ${{ secrets.PORT_CLIENT_ID }}
+          PORT_CLIENT_SECRET: ${{ secrets.PORT_CLIENT_SECRET }}
+        run: |
+          PORT_TOKEN=$(curl -s -X POST https://api.port.io/v1/auth/access_token \
+            -H "Content-Type: application/json" \
+            -d "{\"clientId\":\"${PORT_CLIENT_ID}\",\"clientSecret\":\"${PORT_CLIENT_SECRET}\"}" \
+            | jq -r .accessToken)
+
+          if [ -z "$PORT_TOKEN" ] || [ "$PORT_TOKEN" = "null" ]; then
+            echo "Failed to obtain Port access token."
+            exit 1
+          fi
+
+          echo "::add-mask::$PORT_TOKEN"
+          echo "token=$PORT_TOKEN" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 2 — Fetch repository entity from Port
+      # Extracts the GitHub URL and parses org, repo name, default branch.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Fetch repository entity from Port
+        id: repo_data
+        env:
+          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
+        run: |
+          ENTITY=$(curl -s \
+            "https://api.port.io/v1/blueprints/githubRepository/entities/${REPOSITORY_ID}" \
+            -H "Authorization: Bearer ${PORT_TOKEN}")
+
+          REPO_URL=$(echo "$ENTITY"       | jq -r '.entity.properties.url          // empty')
+          DEFAULT_BRANCH=$(echo "$ENTITY" | jq -r '.entity.properties.defaultBranch // "main"')
+
+          if [ -z "$REPO_URL" ]; then
+            echo "Could not resolve repository URL from Port entity '${REPOSITORY_ID}'."
+            exit 1
+          fi
+
+          # Parse https://github.com/ORG/REPO
+          GH_ORG=$(echo  "$REPO_URL" | awk -F'/' '{print $4}')
+          GH_REPO=$(echo "$REPO_URL" | awk -F'/' '{print $5}')
+
+          echo "repo_url=$REPO_URL"             >> "$GITHUB_OUTPUT"
+          echo "gh_org=$GH_ORG"                >> "$GITHUB_OUTPUT"
+          echo "gh_repo=$GH_REPO"              >> "$GITHUB_OUTPUT"
+          echo "default_branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+
+          echo "Target: $GH_ORG/$GH_REPO (default branch: $DEFAULT_BRANCH)"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 3 — Fetch user entity from Port
+      # Reads the GitHub username via the git_hub_username mirror property.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Fetch user entity from Port
+        id: user_data
+        env:
+          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
+        run: |
+          ENTITY=$(curl -s \
+            "https://api.port.io/v1/blueprints/_user/entities/${USER_IDENTIFIER}" \
+            -H "Authorization: Bearer ${PORT_TOKEN}")
+
+          GH_USERNAME=$(echo "$ENTITY" | jq -r '.entity.mirrorProperties.git_hub_username // empty')
+
+          # Fall back to the Port email when the user hasn't linked a GitHub account
+          echo "gh_username=${GH_USERNAME:-${USER_IDENTIFIER}}" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 4 — Fetch team entity from Port
+      # Reads the human-readable team title for the PR body footer.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Fetch team entity from Port
+        id: team_data
+        env:
+          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
+        run: |
+          if [ -n "$TEAM_IDENTIFIER" ]; then
+            ENTITY=$(curl -s \
+              "https://api.port.io/v1/blueprints/_team/entities/${TEAM_IDENTIFIER}" \
+              -H "Authorization: Bearer ${PORT_TOKEN}")
+            TEAM_NAME=$(echo "$ENTITY" | jq -r '.entity.title // empty')
+          fi
+
+          echo "team_name=${TEAM_NAME:-${TEAM_IDENTIFIER:-(no team)}}" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 5 — GitHub CLI device-flow OAuth
+      #
+      # The workflow acts on behalf of the Port user, so a static PAT is not
+      # appropriate.  GitHub's OAuth device flow lets the user authenticate in
+      # their browser:
+      #   1. Request a device code + one-time code from GitHub.
+      #   2. Post the verification URL and code to the Port action run logs.
+      #   3. Poll GitHub until the user completes authentication (max 10 min).
+      #   4. Log in gh CLI with the resulting access token.
+      #
+      # Prerequisites:
+      #   - Create a GitHub OAuth App (github.com/settings/developers).
+      #   - Enable "Device Authorization" in the app settings.
+      #   - Store the app's Client ID as the repository secret GH_OAUTH_CLIENT_ID.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: GitHub CLI device-flow authentication
+        id: gh_auth
+        env:
+          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
+          GH_OAUTH_CLIENT_ID: ${{ secrets.GH_OAUTH_CLIENT_ID }}
+        run: |
+          set -e
+
+          # 1. Start device flow ────────────────────────────────────────────
+          DEVICE_RESPONSE=$(curl -s -X POST https://github.com/login/device/code \
+            -H "Accept: application/json" \
+            -d "client_id=${GH_OAUTH_CLIENT_ID}&scope=repo")
+
+          DEVICE_CODE=$(echo "$DEVICE_RESPONSE" | jq -r '.device_code      // empty')
+          USER_CODE=$(echo   "$DEVICE_RESPONSE" | jq -r '.user_code        // empty')
+          VERIFY_URI=$(echo  "$DEVICE_RESPONSE" | jq -r '.verification_uri // empty')
+          INTERVAL=$(echo    "$DEVICE_RESPONSE" | jq -r '.interval         // "5"')
+
+          if [ -z "$DEVICE_CODE" ]; then
+            echo "Failed to start GitHub device flow. Response: $DEVICE_RESPONSE"
+            exit 1
+          fi
+
+          echo "Device flow started — URI: $VERIFY_URI  Code: $USER_CODE"
+
+          # 2. Send auth instructions to Port action logs ───────────────────
+          LOG_PAYLOAD=$(jq -n \
+            --arg msg "GitHub Authentication Required
+
+Please open the URL below in your browser and enter the one-time code:
+
+  URL:  ${VERIFY_URI}
+  Code: ${USER_CODE}
+
+Waiting for authentication (timeout: 10 minutes)..." \
+            --arg label "Waiting for Auth" \
+            '{message: $msg, statusLabel: $label}')
+
+          curl -s -X POST "https://api.port.io/v1/actions/runs/${PORT_RUN_ID}/logs" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$LOG_PAYLOAD"
+
+          # 3. Poll until the user authenticates (max 60 × INTERVAL ≈ 10 min)
+          ACCESS_TOKEN=""
+          for i in $(seq 1 60); do
+            sleep "$INTERVAL"
+
+            POLL=$(curl -s -X POST https://github.com/login/oauth/access_token \
+              -H "Accept: application/json" \
+              -d "client_id=${GH_OAUTH_CLIENT_ID}&device_code=${DEVICE_CODE}&grant_type=urn:ietf:params:oauth:grant-type:device_code")
+
+            POLL_ERROR=$(echo "$POLL"  | jq -r '.error         // empty')
+            ACCESS_TOKEN=$(echo "$POLL" | jq -r '.access_token // empty')
+
+            if [ -n "$ACCESS_TOKEN" ]; then
+              echo "Authenticated after attempt $i."
+              break
+            fi
+
+            # authorization_pending / slow_down are expected while waiting
+            if [ -n "$POLL_ERROR" ] \
+               && [ "$POLL_ERROR" != "authorization_pending" ] \
+               && [ "$POLL_ERROR" != "slow_down" ]; then
+              echo "Device flow error: $POLL_ERROR"
+              exit 1
+            fi
+          done
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "GitHub authentication timed out."
+            curl -s -X POST "https://api.port.io/v1/actions/runs/${PORT_RUN_ID}/logs" \
+              -H "Authorization: Bearer ${PORT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"message":"Authentication timed out. Re-run the action and complete login within 10 minutes.","statusLabel":"Auth Timeout"}'
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+
+          # 4. Log in gh CLI ────────────────────────────────────────────────
+          echo "$ACCESS_TOKEN" | gh auth login --with-token
+
+          # 5. Notify Port ─────────────────────────────────────────────────
+          curl -s -X POST "https://api.port.io/v1/actions/runs/${PORT_RUN_ID}/logs" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"message":"GitHub authentication successful. Creating pull request…","statusLabel":"Authenticated"}'
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 6 — Checkout the target repository
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.repo_data.outputs.gh_org }}/${{ steps.repo_data.outputs.gh_repo }}
+          token: ${{ steps.gh_auth.outputs.access_token }}
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 7 — Create branch, commit, open pull request
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Create branch and open pull request
+        id: create_pr
+        env:
+          GH_TOKEN: ${{ steps.gh_auth.outputs.access_token }}
+          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
+          GH_ORG: ${{ steps.repo_data.outputs.gh_org }}
+          GH_REPO: ${{ steps.repo_data.outputs.gh_repo }}
+          DEFAULT_BRANCH: ${{ steps.repo_data.outputs.default_branch }}
+          GH_USERNAME: ${{ steps.user_data.outputs.gh_username }}
+          TEAM_NAME: ${{ steps.team_data.outputs.team_name }}
+        run: |
+          set -e
+
+          git config user.email "$USER_IDENTIFIER"
+          git config user.name  "$GH_USERNAME"
+
+          # Create and push the feature branch.
+          # The empty commit is a scaffold; the developer adds real changes after
+          # the PR is opened.
+          git checkout -b "$BRANCH_NAME"
+          git commit --allow-empty -m "feat: $PR_TITLE"
+          git push origin "$BRANCH_NAME"
+
+          # Build PR body ────────────────────────────────────────────────────
+          FOOTER="---
+**Requested by:** ${USER_IDENTIFIER}
+**Team:** ${TEAM_NAME}"
+          if [ -n "$TAGS" ]; then
+            FOOTER="${FOOTER}
+**Tags:** ${TAGS}"
+          fi
+
+          if [ -n "$PR_DESCRIPTION" ]; then
+            PR_BODY="${PR_DESCRIPTION}
+
+${FOOTER}"
+          else
+            PR_BODY="$FOOTER"
+          fi
+
+          # Ensure PR labels exist before attaching them ────────────────────
+          LABEL_ARGS=()
+          if [ -n "$TAGS" ]; then
+            IFS=',' read -ra TAG_ARRAY <<< "$TAGS"
+            for tag in "${TAG_ARRAY[@]}"; do
+              tag=$(echo "$tag" | xargs)   # trim surrounding whitespace
+              if [ -n "$tag" ]; then
+                gh label create "$tag" \
+                  --repo "${GH_ORG}/${GH_REPO}" \
+                  --force 2>/dev/null || true
+                LABEL_ARGS+=(--label "$tag")
+              fi
+            done
+          fi
+
+          # Open the pull request ───────────────────────────────────────────
+          PR_URL=$(gh pr create \
+            --repo  "${GH_ORG}/${GH_REPO}" \
+            --title "$PR_TITLE" \
+            --body  "$PR_BODY" \
+            --base  "$DEFAULT_BRANCH" \
+            --head  "$BRANCH_NAME" \
+            "${LABEL_ARGS[@]}")
+
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "Pull request opened: $PR_URL"
+
+          # Send PR link to Port logs ───────────────────────────────────────
+          SUCCESS_PAYLOAD=$(jq -n \
+            --arg msg "Pull request created successfully: ${PR_URL}" \
+            --arg label "PR Created" \
+            '{message: $msg, statusLabel: $label}')
+
+          curl -s -X POST "https://api.port.io/v1/actions/runs/${PORT_RUN_ID}/logs" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$SUCCESS_PAYLOAD"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 8 — Report final status to Port (always runs)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Report status to Port
+        if: always()
+        env:
+          PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
+          PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            STATUS="SUCCESS"
+            MSG="Pull request created: ${PR_URL}"
+          else
+            STATUS="FAILURE"
+            MSG="Workflow failed. Check the GitHub Actions run logs for details."
+          fi
+
+          curl -s -X PATCH "https://api.port.io/v1/actions/runs/${PORT_RUN_ID}" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"${STATUS}\",\"message\":{\"run_status\":\"${MSG}\"}}"
