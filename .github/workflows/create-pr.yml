@@ -250,7 +250,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.repo_data.outputs.gh_org }}/${{ steps.repo_data.outputs.gh_repo }}
-          token: ${{ steps.gh_auth.outputs.access_token }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # ──────────────────────────────────────────────────────────────────────
       # STEP 7 — Create branch, commit, open pull request
