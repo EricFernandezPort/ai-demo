@@ -134,7 +134,7 @@ jobs:
         env:
           PORT_TOKEN: ${{ steps.port_auth.outputs.token }}
         run: |
-          if [ -n "$TEAM_IDENTIFIER" ]; then
+          if [ -n "$TEAM_IDENTIFIER" ] && [ "$TEAM_IDENTIFIER" != "null" ]; then
             ENTITY=$(curl -s \
               "https://api.port.io/v1/blueprints/_team/entities/${TEAM_IDENTIFIER}" \
               -H "Authorization: Bearer ${PORT_TOKEN}")
@@ -280,11 +280,11 @@ jobs:
 
           # Build PR body ────────────────────────────────────────────────────
           FOOTER=$(printf -- '---\n**Requested by:** %s\n**Team:** %s' "${USER_IDENTIFIER}" "${TEAM_NAME}")
-          if [ -n "$TAGS" ]; then
+          if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
             FOOTER=$(printf '%s\n**Tags:** %s' "$FOOTER" "${TAGS}")
           fi
 
-          if [ -n "$PR_DESCRIPTION" ]; then
+          if [ -n "$PR_DESCRIPTION" ] && [ "$PR_DESCRIPTION" != "null" ]; then
             PR_BODY=$(printf '%s\n\n%s' "${PR_DESCRIPTION}" "$FOOTER")
           else
             PR_BODY="$FOOTER"
@@ -292,7 +292,7 @@ jobs:
 
           # Ensure PR labels exist before attaching them ────────────────────
           LABEL_ARGS=()
-          if [ -n "$TAGS" ]; then
+          if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
             IFS=',' read -ra TAG_ARRAY <<< "$TAGS"
             for tag in "${TAG_ARRAY[@]}"; do
               tag=$(echo "$tag" | xargs)   # trim surrounding whitespace
